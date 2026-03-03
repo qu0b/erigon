@@ -1042,13 +1042,9 @@ func (io *VersionedIO) AsBlockAccessList() types.BlockAccessList {
 	for _, account := range ac {
 		account.finalize()
 		account.changes.Normalize()
-		// The system address is touched during system calls (EIP-4788 beacon root)
-		// because it is msg.sender. Exclude it when it has no actual state changes,
-		// but keep it when a user tx sends real ETH to it (e.g. SELFDESTRUCT to
-		// the system address or a plain value transfer).
-		if isSystemBALAddress(account.changes.Address) && !hasAccountChanges(account.changes) {
-			continue
-		}
+		// EIP-7928: all accessed addresses must appear in the BAL,
+		// including system addresses with no state changes (e.g. the
+		// SystemAddress used as msg.sender during EIP-4788 beacon root calls).
 		bal = append(bal, account.changes)
 	}
 
@@ -1287,15 +1283,6 @@ func removeStorageRead(ac *types.AccountChanges, slot accounts.StorageKey) {
 	} else {
 		ac.StorageReads = out
 	}
-}
-
-func isSystemBALAddress(addr accounts.Address) bool {
-	return params.IsSystemAddress(addr)
-}
-
-func hasAccountChanges(ac *types.AccountChanges) bool {
-	return len(ac.BalanceChanges) > 0 || len(ac.NonceChanges) > 0 ||
-		len(ac.CodeChanges) > 0 || len(ac.StorageChanges) > 0
 }
 
 type versionedReadSet struct {

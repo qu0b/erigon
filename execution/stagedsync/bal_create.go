@@ -11,7 +11,6 @@ import (
 	"github.com/holiman/uint256"
 
 	"github.com/erigontech/erigon/common/log/v3"
-	"github.com/erigontech/erigon/execution/protocol/params"
 	"github.com/erigontech/erigon/execution/state"
 	"github.com/erigontech/erigon/execution/types"
 	"github.com/erigontech/erigon/execution/types/accounts"
@@ -86,13 +85,9 @@ func CreateBAL(blockNum uint64, txIO *state.VersionedIO, dataDir string) types.B
 	for _, account := range ac {
 		account.finalize()
 		normalizeAccountChanges(account.changes)
-		// The system address is touched during system calls (EIP-4788 beacon root)
-		// because it is msg.sender. Exclude it when it has no actual state changes,
-		// but keep it when a user tx sends real ETH to it (e.g. SELFDESTRUCT to
-		// the system address or a plain value transfer).
-		if isSystemBALAddress(account.changes.Address) && !hasAccountChanges(account.changes) {
-			continue
-		}
+		// EIP-7928: all accessed addresses must appear in the BAL,
+		// including system addresses with no state changes (e.g. the
+		// SystemAddress used as msg.sender during EIP-4788 beacon root calls).
 		bal = append(bal, account.changes)
 	}
 
@@ -223,15 +218,6 @@ func updateAccountWrite(account *accountState, vw *state.VersionedWrite, accessI
 		}
 	default:
 	}
-}
-
-func isSystemBALAddress(addr accounts.Address) bool {
-	return addr == params.SystemAddress
-}
-
-func hasAccountChanges(ac *types.AccountChanges) bool {
-	return len(ac.StorageChanges) > 0 || len(ac.StorageReads) > 0 ||
-		len(ac.BalanceChanges) > 0 || len(ac.NonceChanges) > 0 || len(ac.CodeChanges) > 0
 }
 
 func hasStorageWrite(ac *types.AccountChanges, slot accounts.StorageKey) bool {
