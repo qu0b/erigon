@@ -960,11 +960,11 @@ type execResult struct {
 	stateUpdates *state.StateUpdates
 }
 
-func (result *execResult) finalize(prevReceipt *types.Receipt, engine rules.Engine, vm *state.VersionMap, stateReader state.StateReader, stateWriter state.StateWriter) (*types.Receipt, state.ReadSet, state.VersionedWrites, error) {
+func (result *execResult) finalize(prevReceipt *types.Receipt, engine rules.Engine, vm *state.VersionMap, stateReader state.StateReader, stateWriter state.StateWriter) (*types.Receipt, state.ReadSet, state.VersionedWrites, state.AccessSet, error) {
 	task, ok := result.Task.(*taskVersion)
 
 	if !ok {
-		return nil, nil, nil, fmt.Errorf("unexpected task type: %T", result.Task)
+		return nil, nil, nil, nil, fmt.Errorf("unexpected task type: %T", result.Task)
 	}
 
 	blockNum := task.Version().BlockNum
@@ -1001,7 +1001,7 @@ func (result *execResult) finalize(prevReceipt *types.Receipt, engine rules.Engi
 	txTask, ok := task.Task.(*exec.TxTask)
 
 	if !ok {
-		return nil, nil, nil, nil
+		return nil, nil, nil, nil, nil
 	}
 
 	ibs := state.New(state.NewVersionedStateReader(txIndex, result.TxIn, vm, stateReader))
@@ -1010,17 +1010,20 @@ func (result *execResult) finalize(prevReceipt *types.Receipt, engine rules.Engi
 	ibs.SetVersion(txIncarnation)
 	ibs.SetVersionMap(&state.VersionMap{})
 	if err := ibs.ApplyVersionedWrites(result.TxOut); err != nil {
-		return nil, nil, nil, err
+		return nil, nil, nil, nil, err
 	}
 	ibs.SetTrace(txTask.Trace)
+	// Enable address access tracking so fee calc and postApplyMessage
+	// accesses are captured and can be merged into blockIO.
+	ibs.EnableRecordAccess()
 
 	rules := txTask.EvmBlockContext.Rules(txTask.Config)
 
 	if task.IsBlockEnd() || txIndex < 0 {
 		if err := ibs.FinalizeTx(rules, stateWriter); err != nil {
-			return nil, nil, nil, err
+			return nil, nil, nil, nil, err
 		}
-		return nil, ibs.VersionedReads(), ibs.VersionedWrites(true), nil
+		return nil, ibs.VersionedReads(), ibs.VersionedWrites(true), ibs.AccessedAddresses(), nil
 	}
 
 	if task.shouldDelayFeeCalc {
@@ -1028,17 +1031,17 @@ func (result *execResult) finalize(prevReceipt *types.Receipt, engine rules.Engi
 		if hasBurntDelta {
 			if burntDeltaIncrease {
 				if err := ibs.AddBalance(result.ExecutionResult.BurntContractAddress, burntDelta, tracing.BalanceChangeTransfer); err != nil {
-					return nil, nil, nil, err
+					return nil, nil, nil, nil, err
 				}
 			} else {
 				if err := ibs.SubBalance(result.ExecutionResult.BurntContractAddress, burntDelta, tracing.BalanceChangeTransfer); err != nil {
-					return nil, nil, nil, err
+					return nil, nil, nil, nil, err
 				}
 			}
 		}
 		if !result.ExecutionResult.BurntContractAddress.IsNil() && txTask.Config.IsLondon(blockNum) {
 			if err := ibs.AddBalance(result.ExecutionResult.BurntContractAddress, result.ExecutionResult.FeeBurnt, tracing.BalanceDecreaseGasBuy); err != nil {
-				return nil, nil, nil, err
+				return nil, nil, nil, nil, err
 			}
 		}
 
@@ -1046,16 +1049,16 @@ func (result *execResult) finalize(prevReceipt *types.Receipt, engine rules.Engi
 		if hasCoinbaseDelta {
 			if coinbaseDeltaIncrease {
 				if err := ibs.AddBalance(result.Coinbase, coinbaseDelta, tracing.BalanceChangeTransfer); err != nil {
-					return nil, nil, nil, err
+					return nil, nil, nil, nil, err
 				}
 			} else {
 				if err := ibs.SubBalance(result.Coinbase, coinbaseDelta, tracing.BalanceChangeTransfer); err != nil {
-					return nil, nil, nil, err
+					return nil, nil, nil, nil, err
 				}
 			}
 		}
 		if err := ibs.AddBalance(result.Coinbase, result.ExecutionResult.FeeTipped, tracing.BalanceIncreaseRewardTransactionFee); err != nil {
-			return nil, nil, nil, err
+			return nil, nil, nil, nil, err
 		}
 
 		if engine != nil {
@@ -1070,7 +1073,7 @@ func (result *execResult) finalize(prevReceipt *types.Receipt, engine rules.Engi
 				coinbase, err := cbReader.ReadAccountData(result.Coinbase) // to generate logs we want the initial balance
 
 				if err != nil {
-					return nil, nil, nil, err
+					return nil, nil, nil, nil, err
 				}
 
 				if coinbase != nil {
@@ -1082,7 +1085,7 @@ func (result *execResult) finalize(prevReceipt *types.Receipt, engine rules.Engi
 
 				message, err := task.TxMessage()
 				if err != nil {
-					return nil, nil, nil, err
+					return nil, nil, nil, nil, err
 				}
 
 				postApplyMessageFunc(
@@ -1115,14 +1118,14 @@ func (result *execResult) finalize(prevReceipt *types.Receipt, engine rules.Engi
 	receipt, err := result.CreateNextReceipt(prevReceipt)
 
 	if err != nil {
-		return nil, nil, nil, err
+		return nil, nil, nil, nil, err
 	}
 
 	if hooks := result.TracingHooks(); hooks != nil && hooks.OnTxEnd != nil {
 		hooks.OnTxEnd(receipt, result.Err)
 	}
 
-	return receipt, ibs.VersionedReads(), allWrites, nil
+	return receipt, ibs.VersionedReads(), allWrites, ibs.AccessedAddresses(), nil
 }
 
 type taskVersion struct {
@@ -1530,13 +1533,13 @@ func (be *blockExecutor) nextResult(ctx context.Context, pe *parallelExecutor, r
 
 				stateWriter := state.NewBufferedWriter(pe.rs, nil)
 
-				_, addReads, addWrites, err := txResult.finalize(prevReceipt, pe.cfg.engine, be.versionMap, stateReader, stateWriter)
+				_, addReads, addWrites, addAccesses, err := txResult.finalize(prevReceipt, pe.cfg.engine, be.versionMap, stateReader, stateWriter)
 
 				if err != nil {
 					return nil, err
 				}
 
-				// Merge any additional reads/writes produced during finalize (fee calc, post apply, etc)
+				// Merge any additional reads/writes/accesses produced during finalize (fee calc, post apply, etc)
 				if addReads != nil {
 					mergedReads := MergeReadSets(be.blockIO.ReadSet(txVersion.TxIndex), addReads)
 					be.blockIO.RecordReads(txVersion, mergedReads)
@@ -1553,6 +1556,10 @@ func (be *blockExecutor) nextResult(ctx context.Context, pe *parallelExecutor, r
 					// + fees) when reading via the version map fallback
 					// chain.
 					be.versionMap.FlushVersionedWrites(merged, true, "")
+				}
+				if len(addAccesses) > 0 {
+					existing := be.blockIO.AccessedAddresses(txVersion.TxIndex)
+					be.blockIO.RecordAccesses(txVersion, existing.Merge(addAccesses))
 				}
 
 				stateUpdates := stateWriter.WriteSet()

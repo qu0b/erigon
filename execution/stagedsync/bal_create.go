@@ -157,9 +157,7 @@ func ProcessBAL(tx kv.TemporalRwTx, h *types.Header, vio *state.VersionedIO, blo
 			return fmt.Errorf("block %d: invalid block access list, hash mismatch: got %s expected %s", blockNum, dbBAL.Hash(), headerBALHash)
 		}
 	}
-	// Always validate computed BAL against header. The BalancePath cross-check
-	// in VersionMap.validateRead ensures deterministic parallel execution even
-	// without a stored BAL body (HasBAL=false), so the computed BAL is accurate.
+	// Always validate computed BAL against header.
 	if headerBALHash != bal.Hash() {
 		if dataDir != "" {
 			balDir := filepath.Join(dataDir, "bal")

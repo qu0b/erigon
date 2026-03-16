@@ -2183,6 +2183,15 @@ func (sdb *IntraBlockState) SlotInAccessList(addr accounts.Address, slot account
 	return sdb.accessList.Contains(addr, slot)
 }
 
+// EnableRecordAccess enables address access tracking without a full Prepare().
+// Used by the parallel executor's finalize step to capture fee calc accesses.
+func (sdb *IntraBlockState) EnableRecordAccess() {
+	if sdb.addressAccess == nil {
+		sdb.addressAccess = make(map[accounts.Address]*accessOptions)
+	}
+	sdb.recordAccess = true
+}
+
 func (sdb *IntraBlockState) MarkAddressAccess(addr accounts.Address, revertable bool) {
 	if !sdb.recordAccess || sdb.addressAccess == nil {
 		return
