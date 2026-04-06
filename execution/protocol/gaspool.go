@@ -28,17 +28,20 @@ import (
 // GasPool tracks the amount of gas available during execution of the transactions
 // in a block. The zero value is a pool with zero gas available.
 //
-// EIP-8037 introduces two-dimensional block gas: regular and state. The pool's
-// net per-tx deduction covers only the regular dimension; state gas is validated
-// at block end via GasUsed.BlockGasUsed() = max(Σ regular, Σ state). During
-// execution, buyGas reserves the full tx.gas from the pool (covering both
-// dimensions), and the return path adds back tx.gas − blockRegularGasUsed.
-// State gas that spills from the reservoir into gas_left is accounted for in
-// stateGasConsumed (not regularGasConsumed), so it does not permanently affect
-// the pool — but it does temporarily borrow capacity from it.
+// EIP-8037 introduces two-dimensional block gas: regular and state.
+// After each transaction, remaining = initial - max(cumulativeRegular, cumulativeState).
+// This ensures the block builder stops including transactions once either
+// dimension would exceed the block gas limit.
 type GasPool struct {
-	mu           sync.RWMutex
-	gas, blobGas uint64
+	mu      sync.RWMutex
+	gas     uint64 // remaining gas available
+	blobGas uint64
+
+	// EIP-8037: 2D gas tracking for Amsterdam.
+	initial           uint64 // block gas limit (set via InitAmsterdam)
+	cumulativeRegular uint64 // Σ per-tx regular gas
+	cumulativeState   uint64 // Σ per-tx state gas
+	amsterdam         bool   // true if 2D tracking is active
 }
 
 func NewGasPool(gas, blobGas uint64) *GasPool {
@@ -51,6 +54,24 @@ func (gp *GasPool) Reset(amount, blobGas uint64) {
 		defer gp.mu.Unlock()
 		gp.gas = amount
 		gp.blobGas = blobGas
+		gp.initial = 0
+		gp.cumulativeRegular = 0
+		gp.cumulativeState = 0
+		gp.amsterdam = false
+	}
+}
+
+// InitAmsterdam enables 2D gas tracking for EIP-8037.
+// gasLimit is the block gas limit. priorRegular and priorState are the
+// cumulative gas values from prior AddTransactions batches (0 for the first batch).
+func (gp *GasPool) InitAmsterdam(gasLimit, priorRegular, priorState uint64) {
+	if gp != nil {
+		gp.mu.Lock()
+		defer gp.mu.Unlock()
+		gp.initial = gasLimit
+		gp.cumulativeRegular = priorRegular
+		gp.cumulativeState = priorState
+		gp.amsterdam = true
 	}
 }
 
@@ -81,6 +102,26 @@ func (gp *GasPool) SubGas(amount uint64) error {
 	return nil
 }
 
+// ReturnGasAmsterdam updates the pool after a transaction using 2D gas accounting.
+// remaining = initial - max(cumulativeRegular, cumulativeState).
+// This must be called instead of AddGas for Amsterdam blocks.
+func (gp *GasPool) ReturnGasAmsterdam(txRegular, txState uint64) error {
+	if gp != nil {
+		gp.mu.Lock()
+		defer gp.mu.Unlock()
+		gp.cumulativeRegular += txRegular
+		gp.cumulativeState += txState
+
+		blockUsed := max(gp.cumulativeRegular, gp.cumulativeState)
+		if gp.initial < blockUsed {
+			return fmt.Errorf("%w: block gas overflow: initial %d, used %d (regular: %d, state: %d)",
+				ErrGasLimitReached, gp.initial, blockUsed, gp.cumulativeRegular, gp.cumulativeState)
+		}
+		gp.gas = gp.initial - blockUsed
+	}
+	return nil
+}
+
 // Gas returns the amount of gas remaining in the pool.
 func (gp *GasPool) Gas() uint64 {
 	if gp == nil {
@@ -89,6 +130,26 @@ func (gp *GasPool) Gas() uint64 {
 	gp.mu.RLock()
 	defer gp.mu.RUnlock()
 	return gp.gas
+}
+
+// IsAmsterdam returns whether 2D gas tracking is active.
+func (gp *GasPool) IsAmsterdam() bool {
+	if gp == nil {
+		return false
+	}
+	gp.mu.RLock()
+	defer gp.mu.RUnlock()
+	return gp.amsterdam
+}
+
+// AmsterdamDimensions returns the per-dimension cumulative gas values.
+func (gp *GasPool) AmsterdamDimensions() (regular, state uint64) {
+	if gp == nil {
+		return 0, 0
+	}
+	gp.mu.RLock()
+	defer gp.mu.RUnlock()
+	return gp.cumulativeRegular, gp.cumulativeState
 }
 
 // AddBlobGas makes blob gas available for execution.
@@ -134,5 +195,9 @@ func (gp *GasPool) String() string {
 	}
 	gp.mu.RLock()
 	defer gp.mu.RUnlock()
+	if gp.amsterdam {
+		return fmt.Sprintf("gas: %d, blob_gas: %d (2D: regular=%d, state=%d, initial=%d)",
+			gp.gas, gp.blobGas, gp.cumulativeRegular, gp.cumulativeState, gp.initial)
+	}
 	return fmt.Sprintf("gas: %d, blob_gas: %d", gp.gas, gp.blobGas)
 }

@@ -82,6 +82,9 @@ func (b *BlockGen) SetCoinbase(addr common.Address) {
 	}
 	b.header.Coinbase = addr
 	b.gasPool = new(protocol.GasPool).AddGas(b.header.GasLimit)
+	if b.config.IsAmsterdam(b.header.Time) {
+		b.gasPool.InitAmsterdam(b.header.GasLimit, 0, 0)
+	}
 }
 
 // SetExtra sets the extra data field of the generated block.

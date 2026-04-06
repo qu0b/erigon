@@ -181,6 +181,9 @@ func (b *SimulatedBackend) emptyPendingBlock() {
 	b.pendingReceipts = blockChain.Receipts[0]
 	b.pendingHeader = blockChain.Headers[0]
 	b.gasPool = new(protocol.GasPool).AddGas(b.pendingHeader.GasLimit).AddBlobGas(b.m.ChainConfig.GetMaxBlobGasPerBlock(b.pendingHeader.Time))
+	if b.m.ChainConfig.IsAmsterdam(b.pendingHeader.Time) {
+		b.gasPool.InitAmsterdam(b.pendingHeader.GasLimit, 0, 0)
+	}
 	b.pendingGasUsed = new(protocol.GasUsed)
 	if b.pendingReaderTx != nil {
 		b.pendingReaderTx.Rollback()

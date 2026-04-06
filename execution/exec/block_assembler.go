@@ -176,6 +176,11 @@ func (ba *BlockAssembler) AddTransactions(
 	if header.BlobGasUsed != nil {
 		gasPool.AddBlobGas(ba.cfg.ChainConfig.GetMaxBlobGasPerBlock(header.Time) - *header.BlobGasUsed)
 	}
+	// EIP-8037: Enable 2D gas tracking so the pool limits tx inclusion
+	// based on max(Σ regular, Σ state), not just Σ regular.
+	if ba.cfg.ChainConfig.IsAmsterdam(header.Time) {
+		gasPool.InitAmsterdam(header.GasLimit, ba.gasUsed.BlockRegular, ba.gasUsed.BlockState)
+	}
 	signer := types.MakeSigner(ba.cfg.ChainConfig, header.Number.Uint64(), header.Time)
 
 	var coalescedLogs types.Logs
@@ -200,6 +205,16 @@ func (ba *BlockAssembler) AddTransactions(
 
 	gasUsed := &ba.gasUsed
 
+	// restoreGasPool rebuilds the gas pool to its pre-tx state.
+	// For Amsterdam, this includes restoring 2D cumulative tracking.
+	restoreGasPool := func(gasSnap, blobGasSnap uint64) {
+		restored := new(protocol.GasPool).AddGas(gasSnap).AddBlobGas(blobGasSnap)
+		if ba.cfg.ChainConfig.IsAmsterdam(header.Time) {
+			restored.InitAmsterdam(header.GasLimit, gasUsed.BlockRegular, gasUsed.BlockState)
+		}
+		gasPool = restored
+	}
+
 	var commitTx = func(txn types.Transaction, coinbase accounts.Address, vmConfig *vm.Config, chainConfig *chain.Config, ibs *state.IntraBlockState, current *AssembledBlock) ([]*types.Log, error) {
 		ibs.SetTxContext(current.Header.Number.Uint64(), txnIdx)
 		gasSnap := gasPool.Gas()
@@ -214,14 +229,14 @@ func (ba *BlockAssembler) AddTransactions(
 			paymasterContext, validationGasUsed, err := aa.ValidateAATransaction(aaTxn, ibs, gasPool, header, evm, chainConfig)
 			if err != nil {
 				ibs.RevertToSnapshot(snap, err)
-				gasPool = new(protocol.GasPool).AddGas(gasSnap).AddBlobGas(blobGasSnap)
+				restoreGasPool(gasSnap, blobGasSnap)
 				return nil, err
 			}
 
 			status, aaGasUsed, err := aa.ExecuteAATransaction(aaTxn, paymasterContext, validationGasUsed, gasPool, evm, header, ibs)
 			if err != nil {
 				ibs.RevertToSnapshot(snap, err)
-				gasPool = new(protocol.GasPool).AddGas(gasSnap).AddBlobGas(blobGasSnap)
+				restoreGasPool(gasSnap, blobGasSnap)
 				return nil, err
 			}
 
@@ -243,7 +258,7 @@ func (ba *BlockAssembler) AddTransactions(
 			// Restore cumulative gas to pre-tx values.
 			*gasUsed = gasSnapshot
 			ibs.RevertToSnapshot(snap, err)
-			gasPool = new(protocol.GasPool).AddGas(gasSnap).AddBlobGas(blobGasSnap)
+			restoreGasPool(gasSnap, blobGasSnap)
 			return nil, err
 		}
 		protocol.SetGasUsed(header, gasUsed)

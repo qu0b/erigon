@@ -344,6 +344,11 @@ func (se *serialExecutor) executeBlock(ctx context.Context, tasks []exec.Task, i
 
 		if gasPool == nil {
 			gasPool = protocol.NewGasPool(task.BlockGasLimit(), se.cfg.chainConfig.GetMaxBlobGasPerBlock(tasks[0].BlockTime()))
+			// EIP-8037: Enable 2D gas tracking so the pool correctly limits
+			// based on max(Σ regular, Σ state).
+			if se.cfg.chainConfig.IsAmsterdam(task.BlockTime()) {
+				gasPool.InitAmsterdam(task.BlockGasLimit(), 0, 0)
+			}
 		}
 
 		txTask.ResetGasPool(gasPool)
