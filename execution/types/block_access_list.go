@@ -147,7 +147,35 @@ func (s *BlockAccessListSidecar) copy() *BlockAccessListSidecar {
 
 // DOS protection from very large RLP inputs, remove later if unnecessary
 const (
-	maxBlockAccessListBytes     = 4 << 20 // 4 MiB, >0.93 MiB worst-case described in EIP
+	// maxBlockAccessListBytes bounds a single RLP payload during decode. It must never be
+	// stricter than the consensus rule this package already enforces in ValidateMaxItems, or
+	// erigon answers INVALID for a block every other client accepts, which is a single-client
+	// consensus split. EIP-7928 specifies no byte limit at all: BlockAccessList is a
+	// ProgressiveByteList.
+	//
+	// The previous value, 4 MiB, was justified against the ">0.93 MiB worst case described in
+	// EIP". That worst case is computed at roughly mainnet's gas limit; it scales with the gas
+	// limit, so on a high-gas chain it passes 4 MiB while ValidateMaxItems still accepts the
+	// block. Derive the ceiling from the same relationship instead:
+	//
+	//	items    <= gas_limit / BalItemCost                     (EIP-7928, ValidateMaxItems)
+	//	bytes    <= items * maxBalItemBytes                     (largest item is a slot change:
+	//	                                                         33B key + 33B value + index +
+	//	                                                         list headers, padded to 96)
+	//
+	// evaluated at balCeilingGasLimit. Decode paths have no header in scope, so they use this
+	// ceiling; the gas-limit-exact rule stays in ValidateMaxItems, which is the one that decides
+	// validity.
+	maxBlockAccessListBytes = (balCeilingGasLimit / BalItemCost) * maxBalItemBytes
+
+	// balCeilingGasLimit is the largest block gas limit this decode ceiling covers. Well above
+	// any deployed or scheduled chain; raise it rather than letting the decoder reject a block
+	// ValidateMaxItems accepts.
+	balCeilingGasLimit = 1_000_000_000
+
+	// maxBalItemBytes is a padded upper bound on the RLP encoding of one BAL item.
+	maxBalItemBytes = 96
+
 	maxBlockAccessAccounts      = 1 << 19 // 524,288 accounts ~= 350 accounts per tx at 1500 tx/block
 	maxSlotChangesPerAccount    = 1 << 18 // 262,144 slots per account
 	maxStorageChangesPerSlot    = 1 << 18

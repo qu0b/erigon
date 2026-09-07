@@ -2,6 +2,7 @@ package types
 
 import (
 	"bytes"
+	"encoding/binary"
 	"errors"
 	"reflect"
 	"strings"
@@ -606,5 +607,74 @@ func TestAccountChangesDecodeRLPClearsStorageChanges(t *testing.T) {
 	}
 	if len(ac.StorageChanges) != 0 {
 		t.Fatalf("decode kept %d storage changes from the previous payload", len(ac.StorageChanges))
+	}
+}
+
+// A BAL that ValidateMaxItems accepts must also survive the decoder. The decode-time byte cap is
+// erigon's own DoS guard, not a consensus rule: EIP-7928 gives BlockAccessList no byte limit and
+// bounds it only by items <= gas_limit / BalItemCost. If the byte cap is the stricter of the two,
+// erigon answers INVALID for a block every other client accepts.
+//
+// The previous 4 MiB cap was sized against the EIP's worst case at roughly mainnet's gas limit, so
+// it was already reachable on a 200M-gas chain.
+func TestBlockAccessListDecodeCapIsNotStricterThanTheConsensusItemBound(t *testing.T) {
+	// At 200M gas the largest read-only BAL the item bound permits measures ~2.6 MB, just under
+	// the old 4 MiB cap, so the split was marginal there. It is plainly reachable at the gas
+	// limits chains are moving toward: this is 500M.
+	const gasLimit = 500_000_000
+
+	// The largest BAL the consensus rule permits at this gas limit, built out of storage reads,
+	// which are the cheapest item to reach the bound with.
+	maxItems := uint64(gasLimit / BalItemCost)
+
+	const accountsInBal = 64
+	readsPerAccount := int((maxItems - accountsInBal) / accountsInBal)
+
+	bal := make(BlockAccessList, 0, accountsInBal)
+	for i := 0; i < accountsInBal; i++ {
+		var addr common.Address
+		binary.BigEndian.PutUint64(addr[:8], uint64(i+1))
+
+		reads := make([]accounts.StorageKey, 0, readsPerAccount)
+		for j := 0; j < readsPerAccount; j++ {
+			var slot common.Hash
+			binary.BigEndian.PutUint64(slot[:8], uint64(i+1))
+			binary.BigEndian.PutUint64(slot[24:], uint64(j))
+			reads = append(reads, accounts.InternKey(slot))
+		}
+		bal = append(bal, AccountChanges{
+			Address:      accounts.InternAddress(addr),
+			StorageReads: reads,
+		})
+	}
+
+	if err := bal.ValidateMaxItems(gasLimit); err != nil {
+		t.Fatalf("test BAL is not accepted by the consensus rule, fix the test: %v", err)
+	}
+
+	encoded, err := EncodeBlockAccessListBytes(bal)
+	if err != nil {
+		t.Fatalf("encode BAL: %v", err)
+	}
+	t.Logf("BAL accepted by ValidateMaxItems at a %d gas limit encodes to %d bytes (decode cap %d)",
+		gasLimit, len(encoded), maxBlockAccessListBytes)
+
+	decoded, err := DecodeBlockAccessListBytes(encoded)
+	if err != nil {
+		t.Fatalf("decoder rejected a BAL the consensus rule accepts: %v", err)
+	}
+	if len(decoded) != len(bal) {
+		t.Fatalf("decoded %d accounts, want %d", len(decoded), len(bal))
+	}
+}
+
+// The ceiling still has to be a ceiling: it must bound the payload rather than being effectively
+// infinite, and it must stay consistent with the EIP relationship it is derived from.
+func TestBlockAccessListDecodeCapDerivation(t *testing.T) {
+	if want := (balCeilingGasLimit / BalItemCost) * maxBalItemBytes; maxBlockAccessListBytes != want {
+		t.Fatalf("decode cap = %d, want %d", maxBlockAccessListBytes, want)
+	}
+	if maxBlockAccessListBytes <= 4<<20 {
+		t.Fatalf("decode cap %d is no larger than the old 4 MiB value it replaced", maxBlockAccessListBytes)
 	}
 }
