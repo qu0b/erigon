@@ -49,6 +49,8 @@ import (
 
 // TestingAPI is the interface for the testing_ RPC namespace.
 type TestingAPI interface {
+	InsertRawBlocksV1(ctx context.Context, rawBlocks, rawBALs []hexutil.Bytes) ([]common.Hash, error)
+
 	// BuildBlockV1 synchronously builds and returns an execution payload given a parent hash,
 	// payload attributes, an optional transaction list, and optional extra data.
 	// Unlike the two-phase forkchoiceUpdated+getPayload flow this call blocks until the block

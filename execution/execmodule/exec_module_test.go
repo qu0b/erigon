@@ -2551,6 +2551,43 @@ func TestInsertBlocksWithBatchedFCU(t *testing.T) {
 	}
 }
 
+func TestInsertBlocksWithBatchedFCURejectsIntermediateStateRoot(t *testing.T) {
+	key, err := crypto.GenerateKey()
+	require.NoError(t, err)
+	sender := crypto.PubkeyToAddress(key.PublicKey)
+	genesis := &types.Genesis{
+		Config: chain.AllProtocolChanges,
+		Alloc: types.GenesisAlloc{
+			sender: {Balance: new(big.Int).Exp(big.NewInt(10), big.NewInt(18), nil)},
+		},
+	}
+	m := execmoduletester.New(t, execmoduletester.WithGenesisSpec(genesis), execmoduletester.WithKey(key))
+	pack, err := m.GenerateChain(6, func(i int, b *blockgen.BlockGen) {
+		tx, signErr := types.SignTx(
+			types.NewTransaction(uint64(i), sender, uint256.NewInt(1000), 50000, uint256.NewInt(m.Genesis.BaseFee().Uint64()), nil),
+			*types.LatestSignerForChainID(nil), key)
+		require.NoError(t, signErr)
+		b.AddTx(tx)
+	})
+	require.NoError(t, err)
+	blocks := append([]*types.Block(nil), pack.Blocks...)
+	for i := 2; i < len(blocks); i++ {
+		header := blocks[i].Header()
+		if i == 2 {
+			header.Root = common.Hash{0xde, 0xad}
+		}
+		header.ParentHash = blocks[i-1].Hash()
+		blocks[i] = types.NewBlockFromNetwork(header, blocks[i].Body(), blocks[i].BlockAccessListSidecar())
+	}
+	status, err := m.InsertBlocks(t.Context(), blocks)
+	require.NoError(t, err)
+	require.Equal(t, execmodule.ExecutionStatusSuccess, status)
+	result, err := m.UpdateForkChoice(t.Context(), blocks[len(blocks)-1].Header())
+	require.NoError(t, err)
+	require.Equal(t, execmodule.ExecutionStatusBadBlock, result.Status,
+		"a correct final state root must not hide an invalid intermediate state root")
+}
+
 // TestInsertBlocksWithBatchedFCU_BadBlockRecovery covers the FCU cleanup path:
 // a bad-block FCU closes the local SharedDomains while the persistent
 // currentContext remains, and the next InsertBlocks+FCU cycle must
