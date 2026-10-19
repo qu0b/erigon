@@ -17,6 +17,95 @@ type rawBatchInserter interface {
 	InsertRawBlocksV1(context.Context, []hexutil.Bytes, []hexutil.Bytes) ([]common.Hash, error)
 }
 
+type rawBatchContinuation interface {
+	InsertRawBlocksV2(context.Context, common.Hash, []hexutil.Bytes, []hexutil.Bytes) ([]common.Hash, error)
+}
+
+func TestInsertRawBlocksV2ExtendsStagedDescendant(t *testing.T) {
+	canonical := makeParentHeader(1000)
+	raw, bals, hashes := rawBatchFixture(t, canonical, 128)
+	headers := map[common.Hash]*types.Header{canonical.Hash(): canonical}
+	for _, data := range raw[:112] {
+		var block types.Block
+		require.NoError(t, rlp.DecodeBytes(data, &block))
+		headers[block.Hash()] = block.Header()
+	}
+	inserted := false
+	stub := &stubExecutionModule{
+		currentHeaderFunc: func(context.Context) (*types.Header, error) { return canonical, nil },
+		getHeaderFunc: func(_ context.Context, hash *common.Hash, _ *uint64) (*types.Header, error) {
+			return headers[*hash], nil
+		},
+		insertBlocksFunc: func(_ context.Context, blocks []*types.Block) (execmodule.ExecutionStatus, error) {
+			require.Len(t, blocks, 16)
+			for i, block := range blocks {
+				require.Equal(t, hashes[112+i], block.Hash())
+			}
+			inserted = true
+			return execmodule.ExecutionStatusSuccess, nil
+		},
+		validateChainFunc: func(context.Context, common.Hash, uint64) (execmodule.ValidationResult, error) {
+			t.Fatal("staging must not execute candidate forks")
+			return execmodule.ValidationResult{}, nil
+		},
+		updateForkChoiceFunc: func(context.Context, common.Hash, common.Hash, common.Hash) (execmodule.ForkChoiceResult, error) {
+			t.Fatal("staging must not advance canonical head")
+			return execmodule.ForkChoiceResult{}, nil
+		},
+	}
+	api, ok := newTestingAPI(allForksChainConfig(), stub).(rawBatchContinuation)
+	require.True(t, ok, "testing API must support bounded staged descendants")
+	got, err := api.InsertRawBlocksV2(t.Context(), hashes[111], raw[112:], bals[112:])
+	require.NoError(t, err)
+	require.True(t, inserted)
+	require.Equal(t, hashes[112:], got)
+}
+
+func TestInsertRawBlocksV2RejectsUnboundedOrUnrelatedParent(t *testing.T) {
+	for _, kind := range []string{"too_far", "unrelated", "missing_ancestor", "missing_parent", "missing_canonical"} {
+		t.Run(kind, func(t *testing.T) {
+			canonical := makeParentHeader(1000)
+			count := 3
+			if kind == "too_far" {
+				count = 129
+			}
+			raw, bals, hashes := rawBatchFixture(t, canonical, count)
+			headers := map[common.Hash]*types.Header{canonical.Hash(): canonical}
+			for _, data := range raw[:count-1] {
+				var block types.Block
+				require.NoError(t, rlp.DecodeBytes(data, &block))
+				headers[block.Hash()] = block.Header()
+			}
+			switch kind {
+			case "unrelated":
+				canonical = types.CopyHeader(canonical)
+				canonical.Extra = []byte("other chain")
+			case "missing_ancestor":
+				delete(headers, hashes[0])
+			case "missing_parent":
+				delete(headers, hashes[count-2])
+			case "missing_canonical":
+				canonical = nil
+			}
+			calls := 0
+			stub := &stubExecutionModule{
+				currentHeaderFunc: func(context.Context) (*types.Header, error) { return canonical, nil },
+				getHeaderFunc: func(_ context.Context, hash *common.Hash, _ *uint64) (*types.Header, error) {
+					return headers[*hash], nil
+				},
+				insertBlocksFunc: func(context.Context, []*types.Block) (execmodule.ExecutionStatus, error) {
+					calls++
+					return execmodule.ExecutionStatusSuccess, nil
+				},
+			}
+			api := newTestingAPI(allForksChainConfig(), stub).(rawBatchContinuation)
+			_, err := api.InsertRawBlocksV2(t.Context(), hashes[count-2], raw[count-1:], bals[count-1:])
+			require.Error(t, err)
+			require.Zero(t, calls)
+		})
+	}
+}
+
 func rawBatchFixture(t *testing.T, parent *types.Header, count int) ([]hexutil.Bytes, []hexutil.Bytes, []common.Hash) {
 	t.Helper()
 	raw := make([]hexutil.Bytes, count)
