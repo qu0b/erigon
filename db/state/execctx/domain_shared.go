@@ -1110,6 +1110,14 @@ func (sd *SharedDomains) Flush(ctx context.Context, tx kv.RwTx) error {
 
 func (sd *SharedDomains) flushMem(ctx context.Context, tx kv.RwTx, opts ...kv.FlushOption) error {
 	defer sd.visibleEnds.reset()
+	started := time.Now()
+	var pending, overlayTime time.Duration
+	defer func() {
+		if dbg.ReplayProfile {
+			sd.logger.Info("[replay-profile] flushMem", "txNum", sd.txNum,
+				"pending", pending, "overlay", overlayTime, "total", time.Since(started))
+		}
+	}()
 	if sd.sdCtx.HasPendingUpdate() {
 		if ttx, ok := tx.(kv.TemporalTx); ok {
 			if err := sd.FlushPendingUpdates(ctx, ttx); err != nil {
@@ -1117,11 +1125,14 @@ func (sd *SharedDomains) flushMem(ctx context.Context, tx kv.RwTx, opts ...kv.Fl
 			}
 		}
 	}
+	pending = time.Since(started)
+	overlayStart := time.Now()
 	if overlay := sd.blockOverlay.Load(); overlay != nil {
 		if err := overlay.Flush(ctx, tx); err != nil {
 			return err
 		}
 	}
+	overlayTime = time.Since(overlayStart)
 	return sd.mem.Flush(ctx, tx, opts...)
 }
 
@@ -1186,6 +1197,15 @@ func requireStateVersion(tx kv.Tx, expected uint64) error {
 // A callback error leaves the transaction uncommitted for the caller to roll back.
 func (sd *SharedDomains) Commit(ctx context.Context, tx kv.RwTx, validate ...func(tx kv.RwTx) error) error {
 	defer mxFlushTook.ObserveDuration(time.Now())
+	profileStart := time.Now()
+	var flush, prepare, nativeCommit, publish time.Duration
+	defer func() {
+		if dbg.ReplayProfile {
+			sd.logger.Info("[replay-profile] sharedDomainsCommit", "txNum", sd.txNum,
+				"flush", flush, "prepare", prepare, "nativeCommit", nativeCommit,
+				"publish", publish, "total", time.Since(profileStart))
+		}
+	}()
 	sourceStateVersion, committedStateVersion, err := sd.stateVersionsForCommit(tx)
 	if err != nil {
 		return err
@@ -1207,13 +1227,19 @@ func (sd *SharedDomains) Commit(ctx context.Context, tx kv.RwTx, validate ...fun
 		if err := sd.flushMem(ctx, tx); err != nil {
 			return err
 		}
+		flush = time.Since(profileStart)
+		prepareStart := time.Now()
 		if err := runValidate(); err != nil {
 			return err
 		}
 		if err := requireStateVersion(tx, committedStateVersion); err != nil {
 			return err
 		}
-		return tx.Commit()
+		prepare = time.Since(prepareStart)
+		commitStart := time.Now()
+		err := tx.Commit()
+		nativeCommit = time.Since(commitStart)
+		return err
 	}
 
 	// Stash every cache-bound domain tuple during the flush and publish it only
@@ -1275,6 +1301,8 @@ func (sd *SharedDomains) Commit(ctx context.Context, tx kv.RwTx, validate ...fun
 	if err := sd.flushMem(ctx, tx, opts...); err != nil {
 		return err
 	}
+	flush = time.Since(profileStart)
+	prepareStart := time.Now()
 	for _, cw := range codeStoreWrites {
 		if err := sd.codeStore.PutByHash(tx, cw[0], cw[1]); err != nil {
 			return err
@@ -1328,9 +1356,13 @@ func (sd *SharedDomains) Commit(ctx context.Context, tx kv.RwTx, validate ...fun
 	if err := requireStateVersion(tx, committedStateVersion); err != nil {
 		return err
 	}
+	prepare = time.Since(prepareStart)
+	commitStart := time.Now()
 	if err := tx.Commit(); err != nil {
 		return err
 	}
+	nativeCommit = time.Since(commitStart)
+	publishStart := time.Now()
 	for i := range pendingBranches {
 		u := &pendingBranches[i]
 		if len(u.val) == 0 {
@@ -1347,6 +1379,7 @@ func (sd *SharedDomains) Commit(ctx context.Context, tx kv.RwTx, validate ...fun
 		}
 		sd.cacheUnwind = cacheUnwindState{}
 	}
+	publish = time.Since(publishStart)
 	return nil
 }
 

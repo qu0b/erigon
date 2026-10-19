@@ -874,16 +874,28 @@ func (e *ExecModule) dispatchNotificationsFromOverlay(ctx context.Context, sd *e
 // outer `defer roTx.Rollback()` unchanged.
 func (e *ExecModule) runForkchoiceFlushCommit(sd *execctx.SharedDomains, roTxToCloseBeforeCommit kv.TemporalTx, finishProgressBefore uint64, isSynced bool) ([]any, error) {
 	timings := make([]any, 0, 2)
+	profileStart := time.Now()
+	var beginRw, releaseReader, commit, updateHead, forceSync time.Duration
+	defer func() {
+		if dbg.ReplayProfile {
+			e.logger.Info("[replay-profile] forkchoice", "headBefore", finishProgressBefore,
+				"beginRw", beginRw, "releaseReader", releaseReader, "commit", commit,
+				"updateHead", updateHead, "forceSync", forceSync, "total", time.Since(profileStart))
+		}
+	}()
 
 	rwTx, err := e.db.BeginTemporalRw(e.backgroundCtx)
 	if err != nil {
 		return nil, fmt.Errorf("fcu flush+commit: begin rw: %w", err)
 	}
 	defer rwTx.Rollback()
+	beginRw = time.Since(profileStart)
+	readerStart := time.Now()
 	// Release the read snapshot before committing — Commit doesn't read it.
 	if roTxToCloseBeforeCommit != nil {
 		roTxToCloseBeforeCommit.Rollback()
 	}
+	releaseReader = time.Since(readerStart)
 	flushStart := time.Now()
 	if err := sd.Commit(e.backgroundCtx, rwTx, func(kv.RwTx) error {
 		e.observeStateTransition(e.backgroundCtx, StateTransitionCommitReady)
@@ -891,9 +903,11 @@ func (e *ExecModule) runForkchoiceFlushCommit(sd *execctx.SharedDomains, roTxToC
 	}); err != nil {
 		return nil, err
 	}
+	commit = time.Since(flushStart)
 	timings = append(timings, "flush+commit", common.Round(time.Since(flushStart), 0))
 
 	// Update head and announce block range (notifications already dispatched).
+	headStart := time.Now()
 	if e.hook != nil {
 		if err := e.db.View(e.backgroundCtx, func(tx kv.Tx) error {
 			return e.hook.UpdateHead(tx, finishProgressBefore, isSynced)
@@ -901,12 +915,15 @@ func (e *ExecModule) runForkchoiceFlushCommit(sd *execctx.SharedDomains, roTxToC
 			return nil, err
 		}
 	}
+	updateHead = time.Since(headStart)
 	// Force fsync so data is durable before the next slot.
+	syncStart := time.Now()
 	if err := e.db.Update(e.backgroundCtx, func(tx kv.RwTx) error {
 		return kv.IncrementKey(tx, kv.DatabaseInfo, []byte("chaindata_force"))
 	}); err != nil {
 		return nil, err
 	}
+	forceSync = time.Since(syncStart)
 	return timings, nil
 }
 

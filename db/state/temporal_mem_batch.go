@@ -26,11 +26,14 @@ import (
 	"maps"
 	"slices"
 	"sync"
+	"time"
 	"unsafe"
 
 	btree2 "github.com/tidwall/btree"
 
 	"github.com/erigontech/erigon/common"
+	"github.com/erigontech/erigon/common/dbg"
+	"github.com/erigontech/erigon/common/log/v3"
 	"github.com/erigontech/erigon/db/kv"
 	"github.com/erigontech/erigon/db/rawdb"
 	"github.com/erigontech/erigon/db/state/changeset"
@@ -737,6 +740,14 @@ func (sd *TemporalMemBatch) Merge(o kv.TemporalMemBatch) error {
 // holding all domain locks without re-acquiring. PlainStateVersion advances here
 // with the domain writes; metadata overlays must not advance it independently.
 func (sd *TemporalMemBatch) flushLocked(ctx context.Context, tx kv.RwTx) error {
+	started := time.Now()
+	var unwind, diffSet, writers time.Duration
+	defer func() {
+		if dbg.ReplayProfile {
+			log.Info("[replay-profile] temporalFlush", "unwind", unwind, "diffSet", diffSet,
+				"writers", writers, "changeSets", len(sd.pastChangesAccumulator), "total", time.Since(started))
+		}
+	}()
 	if sd.unwindChangesetRaw != nil {
 		for domain := range sd.unwindChangesetRaw {
 			slices.SortFunc(sd.unwindChangesetRaw[domain], func(a, b kv.DomainEntryDiff) int {
@@ -747,12 +758,17 @@ func (sd *TemporalMemBatch) flushLocked(ctx context.Context, tx kv.RwTx) error {
 			return err
 		}
 	}
+	unwind = time.Since(started)
+	diffStart := time.Now()
 	if err := sd.flushDiffSet(ctx, tx); err != nil {
 		return err
 	}
+	diffSet = time.Since(diffStart)
+	writersStart := time.Now()
 	if err := sd.flushWriters(ctx, tx); err != nil {
 		return err
 	}
+	writers = time.Since(writersStart)
 	if _, err := rawdb.IncrementStateVersion(tx); err != nil {
 		return fmt.Errorf("can't write plain state version: %w", err)
 	}
