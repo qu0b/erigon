@@ -101,9 +101,13 @@ type Domain struct {
 }
 
 type domainVisible struct {
-	files  visibleFiles
-	name   kv.Domain
-	caches *sync.Pool
+	files     visibleFiles
+	name      kv.Domain
+	caches    *sync.Pool
+	union     *domainUnion
+	unionSalt uint32
+	unionOnce sync.Once
+	unionErr  error
 }
 
 func NewDomain(cfg statecfg.DomainCfg, stepSize, stepsInFrozenFile uint64, dirs datadir.Dirs, logger log.Logger) (*Domain, error) {
@@ -1512,7 +1516,11 @@ func (dt *DomainRoTx) lookupLatestFromFiles(k, buf []byte, maxTxNum uint64, boun
 
 	// Walk newest→oldest; skip files starting strictly after maxTxNum so a key's
 	// last write in an older .kv is still found (walkback bounded by maxTxNum).
-	for i, f := range slices.Backward(dt.files) {
+	lookupFiles, lookupErr := dt.lookupFiles(hi)
+	if lookupErr != nil {
+		return nil, false, 0, 0, lookupErr
+	}
+	for i, f := range slices.Backward(lookupFiles) {
 		if bounded && f.startTxNum > maxTxNum {
 			continue
 		}
